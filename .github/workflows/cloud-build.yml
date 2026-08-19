@@ -124,12 +124,7 @@ jobs:
 
           set +e
           source build/envsetup.sh
-          envsetup_status=$?
           set -e
-          if [[ $envsetup_status -ne 0 ]]; then
-            echo "build/envsetup.sh returned ${envsetup_status}" >&2
-            exit "$envsetup_status"
-          fi
 
           lunch "twrp_${DEVICE}-eng"
           mka adbd bootimage recoveryimage -j"$(nproc --all)" \
