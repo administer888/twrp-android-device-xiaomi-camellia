@@ -1,0 +1,203 @@
+name: Cloud build OrangeFox for camellia
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orangefox-camellia-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: OrangeFox 12.1 / camellia
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      MANIFEST_BRANCH: "12.1"
+      DEVICE: camellia
+      DEVICE_PATH: device/xiaomi/camellia
+      DEVICE_TREE_URL: https://github.com/rwxrx-rx/twrp-android-device-xiaomi-camellia.git
+      DEVICE_TREE_COMMIT: 3dcbee803ae7c7e02d68dd908a4795a4d8a6d048
+      SRC_DIR: ${{ github.workspace }}/fox_12.1
+
+    steps:
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 \
+            git-lfs \
+            linux-modules-extra-"$(uname -r)" \
+            zram-tools
+          git clone --depth=1 --branch master \
+            https://gitlab.com/OrangeFox/misc/scripts.git /tmp/orangefox-scripts
+          sudo bash /tmp/orangefox-scripts/setup/android_build_env.sh
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /tmp/orangefox-scripts
+
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+        with:
+          root-reserve-mb: "4096"
+          temp-reserve-mb: "512"
+          swap-size-mb: "4096"
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Configure compressed memory swap
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if sudo modprobe zram; then
+            sudo systemctl stop zramswap.service 2>/dev/null || true
+            sudo swapoff /dev/zram0 2>/dev/null || true
+            sudo zramctl --reset /dev/zram0 2>/dev/null || true
+            zram_dev="$(sudo zramctl --find --size 12G --algorithm zstd)"
+            sudo mkswap "$zram_dev"
+            sudo swapon --priority 1000 "$zram_dev"
+          fi
+          free -h
+          df -h
+
+      - name: Sync OrangeFox 12.1 sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config --global user.name "Codex cloud build"
+          git config --global user.email "administer888@users.noreply.github.com"
+          git config --global advice.detachedHead false
+
+          git clone --depth=1 --branch master \
+            https://gitlab.com/OrangeFox/sync.git "${GITHUB_WORKSPACE}/orangefox-sync"
+          cd "${GITHUB_WORKSPACE}/orangefox-sync"
+          ./orangefox_sync.sh \
+            --branch "${MANIFEST_BRANCH}" \
+            --path "${SRC_DIR}" 2>&1 | tee "${GITHUB_WORKSPACE}/sync.log"
+
+          cd "${SRC_DIR}"
+          repo manifest -r -o "${GITHUB_WORKSPACE}/pinned-manifest.xml"
+          df -h
+
+      - name: Install the pinned camellia device tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "${SRC_DIR}/device/xiaomi"
+          git init "${SRC_DIR}/${DEVICE_PATH}"
+          git -C "${SRC_DIR}/${DEVICE_PATH}" remote add origin "${DEVICE_TREE_URL}"
+          git -C "${SRC_DIR}/${DEVICE_PATH}" fetch --depth=1 origin "${DEVICE_TREE_COMMIT}"
+          git -C "${SRC_DIR}/${DEVICE_PATH}" checkout --detach FETCH_HEAD
+
+          actual_commit="$(git -C "${SRC_DIR}/${DEVICE_PATH}" rev-parse HEAD)"
+          test "$actual_commit" = "${DEVICE_TREE_COMMIT}"
+          echo "DEVICE_TREE_COMMIT=${actual_commit}" | tee "${GITHUB_WORKSPACE}/device-tree.txt"
+
+      - name: Build OrangeFox images
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "${SRC_DIR}"
+
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export DISABLE_VINTF_CHECK=true
+          export FOX_BUILD_DEVICE="${DEVICE}"
+          export FOX_BUILD_LOG_FILE="${GITHUB_WORKSPACE}/fox-environment.log"
+          export LC_ALL=C
+          export SKIP_ABI_CHECKS=true
+          export SKIP_VINTF_CHECK=true
+          export USE_CCACHE=0
+          : > "${FOX_BUILD_LOG_FILE}"
+
+          if [[ -f build/soong/ui/build/sandbox_linux.go ]]; then
+            sed -i 's/return sandboxConfig\.working/return false/g' \
+              build/soong/ui/build/sandbox_linux.go
+          fi
+
+          set +e
+          source build/envsetup.sh
+          envsetup_status=$?
+          set -e
+          if [[ $envsetup_status -ne 0 ]]; then
+            echo "build/envsetup.sh returned ${envsetup_status}" >&2
+            exit "$envsetup_status"
+          fi
+
+          lunch "twrp_${DEVICE}-eng"
+          mka adbd bootimage recoveryimage -j"$(nproc --all)" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Validate and collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          set -euxo pipefail
+          product_dir="${SRC_DIR}/out/target/product/${DEVICE}"
+          deliverables="${GITHUB_WORKSPACE}/deliverables"
+          mkdir -p "$deliverables"
+
+          mapfile -d '' images < <(
+            find "$product_dir" -maxdepth 2 -type f \
+              \( -name 'OrangeFox*.img' -o -name 'boot.img' -o -name 'recovery.img' \) \
+              -print0
+          )
+          if [[ ${#images[@]} -eq 0 ]]; then
+            echo "No recovery or boot image was produced" >&2
+            exit 1
+          fi
+
+          for image in "${images[@]}"; do
+            cp -f "$image" "$deliverables/"
+          done
+          find "$product_dir" -maxdepth 2 -type f -name 'OrangeFox*.zip' \
+            -exec cp -f {} "$deliverables/" \;
+
+          (
+            cd "$deliverables"
+            sha256sum * > SHA256SUMS.txt
+            file * > FILE_INFO.txt
+            ls -lh > FILE_LIST.txt
+          )
+
+          avbtool="${SRC_DIR}/out/host/linux-x86/bin/avbtool"
+          if [[ -x "$avbtool" ]]; then
+            for image in "$deliverables"/*.img; do
+              "$avbtool" info_image --image "$image" \
+                > "$deliverables/$(basename "$image").avb.txt" 2>&1 || true
+            done
+          fi
+
+          cat "$deliverables/FILE_LIST.txt"
+          cat "$deliverables/SHA256SUMS.txt"
+
+      - name: Upload recovery deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-camellia-${{ github.run_id }}
+          path: deliverables/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload build records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-camellia-build-records-${{ github.run_id }}
+          path: |
+            sync.log
+            build.log
+            fox-environment.log
+            device-tree.txt
+            pinned-manifest.xml
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
