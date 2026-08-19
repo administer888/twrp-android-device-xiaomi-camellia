@@ -57,14 +57,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          if sudo modprobe zram; then
-            sudo systemctl stop zramswap.service 2>/dev/null || true
-            sudo swapoff /dev/zram0 2>/dev/null || true
-            sudo zramctl --reset /dev/zram0 2>/dev/null || true
-            zram_dev="$(sudo zramctl --find --size 12G --algorithm zstd)"
-            sudo mkswap "$zram_dev"
-            sudo swapon --priority 1000 "$zram_dev"
-          fi
+          sudo modprobe zram
+          sudo tee /etc/default/zramswap >/dev/null <<'EOF'
+          ALGO=zstd
+          PERCENT=90
+          PRIORITY=1000
+          EOF
+          sudo systemctl restart zramswap
+          zramctl
           free -h
           df -h
 
